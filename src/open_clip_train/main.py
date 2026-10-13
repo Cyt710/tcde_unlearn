@@ -558,13 +558,9 @@ def main(args):
             from open_clip.loss import CLIPEraseLoss
             loss = CLIPEraseLoss(
                 lambda_rm=args.lambda_rm,
-                lambda_fm=args.lambda_fm,
                 lambda_cm=args.lambda_cm,
                 lambda_unif=args.lambda_unif,
                 lambda_dist=args.lambda_dist,
-                lambda_ga=args.lambda_ga,
-                lambda_gd=args.lambda_gd,
-                lambda_kl=args.lambda_kl,
                 temperature=args.cliperase_temperature
             )
             logging.info(f"Using CLIPErase loss: λ_rm={args.lambda_rm}, λ_fm={args.lambda_fm}, λ_cm={args.lambda_cm},λ_unif={args.lambda_unif},λ_dist={args.lambda_dist},λ_ga={args.lambda_ga},λ_gd={args.lambda_gd},λ_kl={args.lambda_kl}")

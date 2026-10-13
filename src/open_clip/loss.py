@@ -464,57 +464,81 @@ class SigLipLoss(nn.Module):
         return {"contrastive_loss": loss} if output_dict else loss
 
 
-
-
 class CLIPEraseLoss(nn.Module):
     def __init__(self,
                  lambda_rm: float = 0.0,
-                 lambda_fm: float = 0.0,
                  lambda_cm: float = 0.0,
                  lambda_unif: float = 0.0,
-                 lambda_dist: float = 0.0,
-                 lambda_ga: float = 0.0,     
-                 lambda_gd: float = 0.0,      
-                 lambda_kl: float = 0.0,     
+                 lambda_dist: float = 0.0,  
                  temperature: float = 0.07):
         super().__init__()
 
         self.lambda_rm = lambda_rm
-        self.lambda_fm = lambda_fm
         self.lambda_cm = lambda_cm
         self.lambda_unif = lambda_unif     
-        self.lambda_dist = lambda_dist     
-        self.lambda_ga = lambda_ga          
-        self.lambda_gd = lambda_gd          
-        self.lambda_kl = lambda_kl          
+        self.lambda_dist = lambda_dist 
         self.temperature = temperature
+        self.is_cliperase = True
+        self.noise_std = 0.08
+        self.noise_type = "gaussian"
 
         self.ema_rank = None
-        self.ema_lambda_fm = lambda_fm
 
-    def hypersphere_uniformity(self, x, t=2):
+    def add_text_noise(self, x, std=None):
+        if std is None:
+            std = self.noise_std
+        
+        original_norm = torch.norm(x, dim=-1, keepdim=True)
+        
+        if self.noise_type == "gaussian":
+            noise = torch.randn_like(x) * std
+        elif self.noise_type == "uniform":
+            noise = (torch.rand_like(x) - 0.5) * 2 * std * np.sqrt(3)
+        else:
+            raise ValueError(f"Unknown noise_type: {self.noise_type}")
+        
+        x_noisy = x + noise
+        new_norm = torch.norm(x_noisy, dim=-1, keepdim=True)
+        x_noisy = x_noisy * (original_norm / new_norm.clamp(min=1e-8))
+        
+        return x_noisy
+
+    def hypersphere_uniformity(self, x, t=2, weights=None):
+        
         x = F.normalize(x, dim=-1)
-        pdist = torch.cdist(x, x, p=2) ** 2   # squared Euclidean
-        loss = torch.log(torch.exp(-t * pdist).mean() + 1e-12)
+        pdist = torch.cdist(x, x, p=2) ** 2
+        exp_vals = torch.exp(-t * pdist)
+        
+        loss_per_sample = torch.log(exp_vals.mean(dim=1) + 1e-12)  # [B]
+        
+        if weights is not None:
+            weights = weights / weights.sum()
+            loss = (loss_per_sample * weights).sum()
+        else:
+            loss = loss_per_sample.mean()
+        
         return loss
 
-    def energy_distance(self, f, g, t):
+    def energy_distance(self, f, g, t, f_weights=None):
+        
         f = F.normalize(f, dim=-1)
         g = F.normalize(g, dim=-1)
         t = F.normalize(t, dim=-1)
+        dist_fg = torch.cdist(f, g, p=2)
+        mean_fg_per_sample = dist_fg.mean(dim=1) 
         
-        if torch.isnan(f).any():
-            print("WARNING: f_norm contains NaN!")
-    
-        dist_fg = torch.cdist(f, g, p=2) 
-        dist_ft = torch.cdist(f, t, p=2) 
-    
-        mean_fg = dist_fg.mean()
-        mean_ft = dist_ft.mean()
-    
-        loss_mean = (mean_fg - mean_ft).abs()
-    
-        return loss_mean 
+        dist_ft = torch.cdist(f, t, p=2)
+        mean_ft_per_sample = dist_ft.mean(dim=1)  
+        
+        loss_per_sample = (mean_fg_per_sample - mean_ft_per_sample).abs()  
+        
+        if f_weights is not None:
+            f_weights = f_weights / f_weights.sum()
+            loss = (loss_per_sample * f_weights).sum()
+        else:
+            loss = loss_per_sample.mean()
+        
+        return loss
 
     def compute_similarity_matrix(self, image_features, text_features):
         image_features = F.normalize(image_features, dim=-1)
@@ -524,11 +548,7 @@ class CLIPEraseLoss(nn.Module):
         logits_txt = (text_features @ image_features.t()) / self.temperature
         return logits_img, logits_txt
 
-    def forgetting_loss(self, img, txt):
-        img = F.normalize(img, dim=-1)
-        txt = F.normalize(txt, dim=-1)
-        sim = torch.sum(img * txt, dim=-1)
-        return sim.mean()
+
 
     def retention_loss(self, img, txt):
         logit_i, logit_t = self.compute_similarity_matrix(img, txt)
@@ -550,161 +570,86 @@ class CLIPEraseLoss(nn.Module):
             F.kl_div(F.log_softmax(n_i, dim=-1), F.softmax(o_i, dim=-1), reduction="batchmean") +
             F.kl_div(F.log_softmax(n_t, dim=-1), F.softmax(o_t, dim=-1), reduction="batchmean")
         ) / 2
+  
     
     
-    def gradient_ascent_loss(self, image_features, text_features):
-       
-        loss = -self.retention_loss(image_features, text_features)
-        return loss
-    
-    def gradient_difference_loss(self, forget_img, forget_txt, retain_img, retain_txt):
-        
-        forget_loss = -self.retention_loss(forget_img, forget_txt)
-        retain_loss = self.retention_loss(retain_img, retain_txt)
-        
-        loss = forget_loss + retain_loss
-        return loss
-    
-    def kl_divergence_loss(self, forget_img, forget_txt, 
-                          retain_img, retain_txt, 
-                          original_retain_img, original_retain_txt):
-        
-        forget_loss = -self.retention_loss(forget_img, forget_txt)
-       
-        orig_i, orig_t = self.compute_similarity_matrix(original_retain_img, original_retain_txt)
-        
-        curr_i, curr_t = self.compute_similarity_matrix(retain_img, retain_txt)
-        
-        kl_loss = (
-            F.kl_div(F.log_softmax(curr_i, dim=-1), F.softmax(orig_i, dim=-1), reduction="batchmean") +
-            F.kl_div(F.log_softmax(curr_t, dim=-1), F.softmax(orig_t, dim=-1), reduction="batchmean")
-        ) / 2
-        
-        
-        loss = forget_loss + kl_loss
-        return loss, forget_loss, kl_loss
-    
+
     def forward(self,
                 batch_image_features, batch_text_features,
                 original_batch_image_features, original_batch_text_features,
-                flags):
+                flags,
+                sample_weights=None):
         
         forget_mask = flags.bool()
         retain_mask = ~forget_mask
         device = flags.device
 
-        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        total_loss = torch.zeros((), device=device, requires_grad=True)
         loss_dict = {}
 
+        if sample_weights is not None:
+            sample_weights = sample_weights.to(device)
+            forget_weights = sample_weights[forget_mask] if forget_mask.sum() > 0 else None
+        else:
+            forget_weights = None
+
+        if forget_weights is not None:
+            loss_dict["forget_weight_mean"] = forget_weights.mean().item()
+            loss_dict["forget_weight_sum"] = forget_weights.sum().item()
+
         if self.lambda_rm != 0:
-            if retain_mask.sum() > 0:
+            if retain_mask.sum() > 0 and forget_mask.sum() > 0 :
                 r_img = batch_image_features[retain_mask]
                 r_txt = batch_text_features[retain_mask]
                 loss_rm = self.retention_loss(r_img, r_txt)
-
-                total_loss = total_loss +self.lambda_rm * loss_rm
+                total_loss = total_loss + self.lambda_rm * loss_rm
                 loss_dict["retention_loss"] = loss_rm.item()
             else:
                 loss_dict["retention_loss"] = 0.0
         
-        if self.lambda_fm!= 0:
+
+        if self.lambda_unif != 0:
             if forget_mask.sum() > 0:
                 f_img = batch_image_features[forget_mask]
                 f_txt = batch_text_features[forget_mask]
-
-                loss_fm = self.forgetting_loss(f_img, f_txt)
-                loss_dict["forgetting_loss"] = loss_fm.item()
-                total_loss =total_loss + self.lambda_fm * loss_fm
-            else:
-                loss_dict["forgetting_loss"] = 0.0
-
-        if self.lambda_unif != 0:
-            if forget_mask.sum() >0 :
-                f_img = batch_image_features[forget_mask]
-                f_txt = batch_text_features[forget_mask]
-                loss_unif_img = self.hypersphere_uniformity(f_img)
-                loss_unif_txt = self.hypersphere_uniformity(f_txt)
+                loss_unif_img = self.hypersphere_uniformity(f_img, weights=forget_weights)
+                loss_unif_txt = self.hypersphere_uniformity(f_txt, weights=forget_weights)
                 loss_uniform = loss_unif_img + loss_unif_txt
                 loss_dict["uniform_loss"] = loss_uniform.item()
-                total_loss =total_loss + self.lambda_unif * loss_uniform
+                total_loss = total_loss + self.lambda_unif * loss_uniform
             else:
                 loss_dict["uniform_loss"] = 0.0
- 
 
-        if self.lambda_dist !=0:
-            if retain_mask.sum() and forget_mask.sum()> 0:
+        if self.lambda_dist != 0:
+            if retain_mask.sum() > 0 and forget_mask.sum() > 0:
                 r_img = batch_image_features[retain_mask]
                 r_txt = batch_text_features[retain_mask]
                 f_img = batch_image_features[forget_mask]
                 f_txt = batch_text_features[forget_mask]
+                f_txt = self.add_text_noise(f_txt)
 
                 loss_dist = (
-                    self.energy_distance(f_img, r_txt, f_txt) +
-                    self.energy_distance(f_txt, r_img, f_img)
+                    self.energy_distance(f_img, r_txt, f_txt, f_weights=forget_weights) +
+                    self.energy_distance(f_txt, r_img, f_img, f_weights=forget_weights)
                 )
                 loss_dict["dist_loss"] = loss_dist.item()
                 total_loss = total_loss + self.lambda_dist * loss_dist
             else:
                 loss_dict["dist_loss"] = 0.0
-
         
-        if self.lambda_ga != 0:
-            if forget_mask.sum() > 0:
-                f_img = batch_image_features[forget_mask]
-                f_txt = batch_text_features[forget_mask]
-                loss_ga = self.gradient_ascent_loss(f_img, f_txt)
-                total_loss = total_loss + self.lambda_ga * loss_ga
-                loss_dict["GA_loss"] = loss_ga.item()
-            else:
-                loss_dict["GA_loss"] = 0.0
-        
-        if self.lambda_gd != 0:
-            if forget_mask.sum() > 0 and retain_mask.sum() > 0:
-                f_img = batch_image_features[forget_mask]
-                f_txt = batch_text_features[forget_mask]
-                r_img = batch_image_features[retain_mask]
-                r_txt = batch_text_features[retain_mask]
-            
-                loss_gd = self.gradient_difference_loss(f_img, f_txt, r_img, r_txt)
-                total_loss =total_loss + self.lambda_gd * loss_gd
-                loss_dict["GD_loss"] = loss_gd.item()
-            else:
-                loss_dict["GD_loss"] = 0.0
-       
-        if self.lambda_kl != 0 :
-            if forget_mask.sum() > 0 and retain_mask.sum() > 0:
-                f_img = batch_image_features[forget_mask]
-                f_txt = batch_text_features[forget_mask]
-                r_img = batch_image_features[retain_mask]
-                r_txt = batch_text_features[retain_mask]
-                ri_o = original_batch_image_features[retain_mask]
-                rt_o = original_batch_text_features[retain_mask]
-            
-                loss_kl, forget_part, kl_part = self.kl_divergence_loss(
-                    f_img, f_txt, r_img, r_txt, ri_o, rt_o
-                )
-                total_loss =total_loss + self.lambda_kl * loss_kl
-                loss_dict["KL_loss"] = loss_kl.item()
-                loss_dict["KL_forget_part"] = forget_part.item()
-                loss_dict["KL_kl_part"] = kl_part.item()
-            else:
-                loss_dict["KL_loss"] = 0.0
-                loss_dict["KL_forget_part"] = 0.0
-                loss_dict["KL_kl_part"] = 0.0
 
         if self.lambda_cm != 0:
-
-            if retain_mask.sum() > 0:
+            if retain_mask.sum() > 0 and forget_mask.sum() > 0:
                 ri_o = original_batch_image_features[retain_mask]
                 rt_o = original_batch_text_features[retain_mask]
                 ri_n = batch_image_features[retain_mask]
                 rt_n = batch_text_features[retain_mask]
-
                 loss_cm = self.consistency_loss(ri_o, rt_o, ri_n, rt_n)
-                total_loss =total_loss + self.lambda_cm * loss_cm
+                total_loss = total_loss + self.lambda_cm * loss_cm
                 loss_dict["consistency_loss"] = loss_cm.item()
             else:
                 loss_dict["consistency_loss"] = 0.0
 
-        loss_dict["total_loss"] = float(total_loss)
+
+        loss_dict["total_loss"] = float(total_loss.detach())
         return total_loss, loss_dict

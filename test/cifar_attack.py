@@ -165,7 +165,6 @@ def load_model_from_checkpoint(model, checkpoint_path, device):
     
     return model
 
-#Usage Example:
 def main():
     config = {
         "dataset": {
@@ -220,7 +219,7 @@ def main():
     print("\nInitializing model...")
     model = CLIPModel().to(device)
     
-    checkpoint_path = "your path to the trained model checkpoint"
+    checkpoint_path = "/home/cyt/open_clip/src/logs/cliperase_vit_b32_val_20251218_063136/cliperase_vit_b32_val_20251218_063136/checkpoints/epoch_10.pt"
     
     try:
         model = load_model_from_checkpoint(model, checkpoint_path, device)

@@ -32,3 +32,14 @@ Loss terms:
 ---
 
 ## Repository Structure
+
+tcde_unlearn/
+├── model_configs/ # OpenCLIP model configs (ViT-B-32, ViT-L-14, ...)
+├── src/
+│ ├── open_clip/ # OpenCLIP model / loss / tokenizer
+│ └── open_clip_train/ # Training entry point (main.py)
+├── test/ # Evaluation and analysis scripts
+├── .gitignore
+└── README.md
+
+
